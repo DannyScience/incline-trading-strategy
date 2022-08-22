@@ -40,7 +40,7 @@ def get_futures_klines(symbol, limit=500):
     return(df)
 
 
-# Open position for Sybol with
+# Open position for Sybol
 
 def open_position(symbol, s_l, quantity_l):
     sprice = get_symbol_price(symbol)
