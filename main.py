@@ -1,25 +1,158 @@
-import statsmodels.api as sm
+import requests
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import copy
+import time
+import random
 
-apiKey = 'key'
+from binance import Client, ThreadedWebsocketManager, ThreadedDepthCacheManager
+from futures_sign import send_signed_request, send_public_request
+from cred import KEY, SECRET
 
-interval_var = '5min'
-symbol = 'ETH'
-path = 'https://www.alphavantage.co/query?function=CRYPTO_INTRADAY&symbol='+symbol + \
-    '&market=USD&interval='+interval_var+'&apikey=' + \
-    apiKey+'&datatype=csv&outputsize=full'
-df = pd.read_csv(path)
-df = df[::-1].reset_index()
-df = df.drop(['index'], axis=1)
+symbol = 'ETHUSDT'
+client = Client(KEY, SECRET)
+
+maxposition = 0.03
+stop_percent = 0.01
+eth_proffit_array = [[10, 3], [20, 3], [40, 2], [60, 2], [200, 0]]
+#eth_proffit_array = [[20, 1], [40, 1], [60, 2], [80, 2], [100, 2], [150, 1], [200, 1], [200, 0]]
+proffit_array = copy.copy(eth_proffit_array)
+
+pointer = str(random.randint(1000, 9999))
+
+
+# Get last 500 kandels 5 minutes for Symbol
+
+def get_futures_klines(symbol, limit=500):
+    x = requests.get('https://binance.com/fapi/v1/klines?symbol=' +
+                     symbol+'&limit='+str(limit)+'&interval=5m')
+    df = pd.DataFrame(x.json())
+    df.columns = ['open_time', 'open', 'high', 'low', 'close',
+                  'volume', 'close_time', 'd1', 'd2', 'd3', 'd4', 'd5']
+    df = df.drop(['d1', 'd2', 'd3', 'd4', 'd5'], axis=1)
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    return(df)
+
+
+# Open position for Sybol with
+
+def open_position(symbol, s_l, quantity_l):
+    sprice = get_symbol_price(symbol)
+
+    if(s_l == 'long'):
+        close_price = str(round(sprice*(1+0.01), 2))
+        params = {
+            "batchOrders": [
+                {
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "quantity": str(quantity_l),
+                    "timeInForce": "GTC",
+                    "price": close_price
+
+                }
+            ]
+        }
+        responce = send_signed_request('POST', '/fapi/v1/batchOrders', params)
+
+    if(s_l == 'short'):
+        close_price = str(round(sprice*(1-0.01), 2))
+        params = {
+            "batchOrders": [
+                {
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "quantity": str(quantity_l),
+                    "timeInForce": "GTC",
+                    "price": close_price
+                }
+            ]
+        }
+        responce = send_signed_request('POST', '/fapi/v1/batchOrders', params)
+
+
+# Close position for symbol with quantity
+
+def close_position(symbol, s_l, quantity_l):
+    sprice = get_symbol_price(symbol)
+
+    if(s_l == 'long'):
+        close_price = str(round(sprice*(1-0.01), 2))
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+                    "type": "LIMIT",
+                    "quantity": str(quantity_l),
+                    "timeInForce": "GTC",
+                    "price": close_price
+        }
+        responce = send_signed_request('POST', '/fapi/v1/order', params)
+    if(s_l == 'short'):
+        close_price = str(round(sprice*(1+0.01), 2))
+        params = {
+
+            "symbol": symbol,
+            "side": "BUY",
+                    "type": "LIMIT",
+                    "quantity": str(quantity_l),
+                    "timeInForce": "GTC",
+                    "price": close_price
+        }
+        responce = send_signed_request('POST', '/fapi/v1/order', params)
+
+
+# Find all opened positions
+
+def get_opened_positions(symbol):
+    status = client.futures_account()
+    positions = pd.DataFrame(status['positions'])
+    a = positions[positions['symbol'] == symbol]['positionAmt'].astype(float).tolist()[
+        0]
+    leverage = int(positions[positions['symbol'] == symbol]['leverage'])
+    entryprice = positions[positions['symbol'] == symbol]['entryPrice']
+    profit = float(status['totalUnrealizedProfit'])
+    balance = round(float(status['totalWalletBalance']), 2)
+    if a > 0:
+        pos = "long"
+    elif a < 0:
+        pos = "short"
+    else:
+        pos = ""
+    return([pos, a, profit, leverage, balance, round(float(entryprice), 3), 0])
+
+
+# Close all orders
+
+def check_and_close_orders(symbol):
+    global isStop
+    a = client.futures_get_open_orders(symbol=symbol)
+    if len(a) > 0:
+        isStop = False
+        client.futures_cancel_all_open_orders(symbol=symbol)
+
+
+def get_symbol_price(symbol):
+    prices = client.get_all_tickers()
+    df = pd.DataFrame(prices)
+    return float(df[df['symbol'] == symbol]['price'])
+
+
+# INDICATORS
+
 
 # To find a slope of price line
-
-
 def indSlope(series, n):
+
     array_sl = [j*0 for j in range(n-1)]
+
     for j in range(n, len(series)+1):
         y = series[j-n:j]
         x = np.array(range(n))
@@ -45,6 +178,38 @@ def indATR(source_DF, n):
     df_temp = df.drop(['H-L', 'H-PC', 'L-PC'], axis=1)
     return df_temp
 
+# find local mimimum / local maximum
+
+
+def isLCC(DF, i):
+    df = DF.copy()
+    LCC = 0
+
+    if df['close'][i] <= df['close'][i+1] and df['close'][i] <= df['close'][i-1] and df['close'][i+1] > df['close'][i-1]:
+        # найдено Дно
+        LCC = i-1
+    return LCC
+
+
+def isHCC(DF, i):
+    df = DF.copy()
+    HCC = 0
+    if df['close'][i] >= df['close'][i+1] and df['close'][i] >= df['close'][i-1] and df['close'][i+1] < df['close'][i-1]:
+        # найдена вершина
+        HCC = i
+    return HCC
+
+
+def getMaxMinChannel(DF, n):
+    maxx = 0
+    minn = DF['low'].max()
+    for i in range(1, n):
+        if maxx < DF['high'][len(DF)-i]:
+            maxx = DF['high'][len(DF)-i]
+        if minn > DF['low'][len(DF)-i]:
+            minn = DF['low'][len(DF)-i]
+    return(maxx, minn)
+
 # generate data frame with all needed data
 
 
@@ -62,146 +227,119 @@ def PrepareDF(DF):
     df = df.reset_index()
     return(df)
 
-# find local mimimum / local maximum
 
-# MIN
+def check_if_signal(symbol):
+    ohlc = get_futures_klines(symbol, 100)
+    prepared_df = PrepareDF(ohlc)
+    signal = ""  # return value
 
+    i = 98  # 99 is current kandel which is not closed, 98 is last closed candel, we need 97 to check if it is bottom or top
 
-def isLCC(DF, i):
-    df = DF.copy()
-    LCC = 0
+    if isLCC(prepared_df, i-1) > 0:
+       # found bottom - OPEN LONG
+        if prepared_df['position_in_channel'][i-1] < 0.5:
+            # close to top of channel
+            if prepared_df['slope'][i-1] < -20:
+                # found a good enter point for LONG
+                signal = 'long'
 
-    if df['close'][i] <= df['close'][i+1] and df['close'][i] <= df['close'][i-1] and df['close'][i+1] > df['close'][i-1]:
-        # dound low
-        LCC = i-1
-    return LCC
+    if isHCC(prepared_df, i-1) > 0:
+       # found top - OPEN SHORT
+        if prepared_df['position_in_channel'][i-1] > 0.5:
+            # close to top of channel
+            if prepared_df['slope'][i-1] > 20:
+                # found a good enter point for SHORT
+                signal = 'short'
 
-# MAX
-
-
-def isHCC(DF, i):
-    df = DF.copy()
-    HCC = 0
-    if df['close'][i] >= df['close'][i+1] and df['close'][i] >= df['close'][i-1] and df['close'][i+1] < df['close'][i-1]:
-        # found high
-        HCC = i
-    return HCC
-
-
-def getMaxMinChannel(DF, n):
-    maxx = 0
-    minn = 0
-    for i in range(0, n-1):
-        if maxx < DF['high'][len(DF)-i]:
-            maxx = DF['high'][len(DF)-i]
-        if minn > DF['low'][len(DF)-i]:
-            minn = DF['low'][len(DF)-i]
-    return(maxx, minn)
+    return signal
 
 
-# convert time order
-df = df[::-1]
-
-prepared_df = PrepareDF(df)
-lend = len(prepared_df)
-
-# prepared_df[0:1000]['close'].plot()
-# plt.show()
-# prepared_df[0:1000]['slope'].plot()
-# plt.show()
-#prepared_df[0:1000][{'channel_max', 'channel_min', 'close'}].plot()
-# plt.show()
-# prepared_df[0:1000][{'position_in_channel'}].plot()
-# plt.show()
-
-prepared_df['hcc'] = [None] * lend
-prepared_df['lcc'] = [None] * lend
-
-for i in range(4, lend-1):
-    if isHCC(prepared_df, i) > 0:
-        prepared_df.at[i, 'hcc'] = prepared_df['close'][i]
-    if isLCC(prepared_df, i) > 0:
-        prepared_df.at[i, 'lcc'] = prepared_df['close'][i]
+def prt(message):
+    # telegram message
+    print(pointer+': '+message)
 
 
-# backtesting
+def main(step):
+    global proffit_array
 
-position = 0
-deal = 0
-eth_proffit_array = [[20, 1], [40, 1], [60, 2], [
-    80, 2], [100, 2], [150, 1], [200, 1], [200, 0]]
+    try:
+        position = get_opened_positions(symbol)
+        open_sl = position[0]
+        if open_sl == "":  # no position
+            prt('Нет открытых позиций')
+            # close all stop loss orders
+            check_and_close_orders(symbol)
+            signal = check_if_signal(symbol)
+            proffit_array = copy.copy(eth_proffit_array)
 
-prepared_df['deal_o'] = [None]*lend
-prepared_df['deal_c'] = [None]*lend
-prepared_df['earn'] = [None]*lend
+            if signal == 'long':
+                open_position(symbol, 'long', maxposition)
 
-for i in range(4, lend-1):
-    prepared_df.at[i, 'earn'] = deal
-
-    if position > 0:
-        # long
-        if(prepared_df['close'][i] < stop_price):
-            # stop loss
-            deal = deal-(open_price-prepared_df['close'][i])  # *position
-            position = 0
-            print('stop loss')
-            prepared_df.at[i, 'deal_c'] = prepared_df['close'][i]
-
+            elif signal == 'short':
+                open_position(symbol, 'short', maxposition)
         else:
-            print(position, proffit_array)
-            temp_arr = copy.copy(proffit_array)
-            for j in range(0, len(temp_arr)-1):
-                delta = temp_arr[j][0]
-                contracts = temp_arr[j][1]
-                if(prepared_df['close'][i] > (open_price+delta)):
-                    print(i, position, open_price, prepared_df['close'][i])
-                    print(proffit_array)
-                    prepared_df.at[i, 'deal_c'] = prepared_df['close'][i]
-                    position = position-contracts
-                    deal = deal+(prepared_df['close'][i]-open_price)*contracts
-                    del proffit_array[0]
 
-    elif position < 0:
-        # short
-        if(prepared_df['close'][i] > stop_price):
-            # stop loss
-            deal = deal-(prepared_df['close'][i]-open_price)  # *position
-            position = 0
-            prepared_df.at[i, 'deal_c'] = prepared_df['close'][i]
-            print('stop loss')
-        else:
-            temp_arr = copy.copy(proffit_array)
-            for j in range(0, len(temp_arr)-1):
-                delta = temp_arr[j][0]
-                contracts = temp_arr[j][1]
-                if(prepared_df['close'][i] < (open_price-delta)):
-                    print(i, position, open_price, prepared_df['close'][i])
-                    print(proffit_array)
-                    prepared_df.at[i, 'deal_c'] = prepared_df['close'][i]
-                    position = position+contracts
-                    deal = deal+(open_price-prepared_df['close'][i])*contracts
-                    del proffit_array[0]
-    else:
-        if(prepared_df['lcc'][i-1] != None):
-            # long
-            if(prepared_df['position_in_channel'][i-1] < 0.5):
-                if((prepared_df['slope'][i-1]) < -5):
-                    prepared_df.at[i, 'deal_o'] = prepared_df['close'][i]
-                    print(i, 'open long position')
-                    proffit_array = copy.copy(eth_proffit_array)
-                    position = 10
-                    open_price = prepared_df['close'][i]
-                    stop_price = prepared_df['close'][i]*0.99
-        if(prepared_df['hcc'][i-1] != None):
-            # short
-            if(prepared_df['position_in_channel'][i-1] > 0.5):
-                if((prepared_df['slope'][i-1]) > 5):
-                    prepared_df.at[i, 'deal_o'] = prepared_df['close'][i]
-                    print(i, 'open short position')
-                    proffit_array = copy.copy(eth_proffit_array)
-                    position = -10
-                    open_price = prepared_df['close'][i]
-                    stop_price = prepared_df['close'][i]*1.01
+            entry_price = position[5]  # enter price
+            current_price = get_symbol_price(symbol)
+            quantity = position[1]
 
-hours = round(lend*5/60, 0)
-print('Total erned in ', hours, ' hours =', int(deal), '$')
+            prt('Найдена открытая позиция '+open_sl)
+            prt('Кол-во: '+str(quantity))
+
+            if open_sl == 'long':
+                stop_price = entry_price*(1-stop_percent)
+                if current_price < stop_price:
+                    # stop loss
+                    close_position(symbol, 'long', abs(quantity))
+                    proffit_array = copy.copy(eth_proffit_array)
+                else:
+                    temp_arr = copy.copy(proffit_array)
+                    for j in range(0, len(temp_arr)-1):
+                        delta = temp_arr[j][0]
+                        contracts = temp_arr[j][1]
+                        if(current_price > (entry_price+delta)):
+                            # take profit
+                            close_position(symbol, 'long', abs(
+                                round(maxposition*(contracts/10), 3)))
+                            del proffit_array[0]
+
+            if open_sl == 'short':
+                stop_price = entry_price*(1+stop_percent)
+                if current_price > stop_price:
+                    # stop loss
+                    close_position(symbol, 'short', abs(quantity))
+                    proffit_array = copy.copy(eth_proffit_array)
+                else:
+                    temp_arr = copy.copy(proffit_array)
+                    for j in range(0, len(temp_arr)-1):
+                        delta = temp_arr[j][0]
+                        contracts = temp_arr[j][1]
+                        if(current_price < (entry_price-delta)):
+                            # take profit
+                            close_position(symbol, 'short', abs(
+                                round(maxposition*(contracts/10), 3)))
+                            del proffit_array[0]
+
+    except:
+        prt('\n\nSomething went wrong. Continuing...')
+
+
+starttime = time.time()
+# 60 seconds times 60 meaning the script will run for 12 hr
+timeout = time.time() + 60*60*12
+counterr = 1
+
+while time.time() <= timeout:
+    try:
+        print(get_opened_positions(symbol))
+        prt("script continue running at " +
+            time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())))
+        main(counterr)
+        counterr = counterr+1
+        if counterr > 5:
+            counterr = 1
+        # 1 minute interval between each new execution
+        time.sleep(10 - ((time.time() - starttime) % 10.0))
+    except KeyboardInterrupt:
+        print('\n\KeyboardInterrupt. Stopping.')
+        exit()
